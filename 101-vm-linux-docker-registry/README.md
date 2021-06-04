@@ -1,58 +1,118 @@
-# Docker Registry on Azure Stack
+# Docker Registry v2 on Azure Stack
 
-This template deploys a docker registry that uses an existing Azure Stack storage account to persist your container images.
+This template deploys an Ubuntu Server 16.04-LTS virtual machine along with a [custom script extension](script.sh) that installs and configures a [container registry](https://docs.docker.com/registry/) as a docker swarm service.
 
-This template is just for illustrative purposes only and it is **not** recommended for production environments.
+The deployed registry will be configured to persist container images in an Azure Stack storage account, encrypt traffic using TLS, and restrict access using basic HTTP authentication.
 
-## Prerequisites
+## Pre-requisites
 
-1. Ubuntu Server 16.04 is syndicated from Azure Stack's Marketplace
-2. Custom Script Extensions for Linux 2.0 is syndicated from Azure Stack's Marketplace
-3. A storage account to persist container images
-4. A Key Vault instance [enabled for deployment](https://docs.microsoft.com/en-us/azure-stack/user/azure-stack-key-vault-push-secret-into-vm#create-a-key-vault-secret)
-5. A X509 certificate and its private key stored as a Key Vault [secret](https://docs.microsoft.com/en-us/azure-stack/user/azure-stack-key-vault-manage-portal#create-a-secret)
+Make sure you take care of the following pre-requisites before you start the setup process:
+
+- `Ubuntu Server 16.04-LTS` was syndicated from Azure Stack's Marketplace by the operator
+- `Custom Script Extensions for Linux 2.0` was syndicated from Azure Stack's Marketplace by the operator
+- You have access to a X.509 certificate in PFX format
+- You can [connect](https://docs.microsoft.com/en-us/azure-stack/user/azure-stack-powershell-configure-user) to the target Azure Stack instance using PowerShell
 
 ## Setup
 
-Like most web servers, your docker registry will need a X509 certificate to create a HTTPS channel. To automate the registry deployment process, this template assumes that your certificate and its corresponding private key are stored in a Key Vault instance as a PFX archive.
+The following section details the required steps to perform before you deploy the template. It also includes a few PowerShell snippets meant to speed up the setup process.
 
-If your are planning to use `let's encrypt` as your CA, then the `certbot` client can generate the required files for you:
+Once you went through the details, you should be able to tweak the [setup script](setup.ps1) and adjust it to your needs.
 
-```bash
-certbot certonly --standalone -d registry.example.com --email user@example.com
+### Storage configuration
+
+The template instructs the container registry to use the [Azure storage driver](https://docs.docker.com/registry/storage-drivers/azure/) to persist the container images in a local storage account blob container.
+
+### Key Vault configuration
+
+The deployment template will instruct Azure Resource Manager to drop your certificate in the virtual machine's file system. User credentials should be stored as secrets in the same local Key Vault instance where the PFX certificate is stored.
+
+### Basic Authorization
+
+User credentials should be stored as secrets in the same local Key Vault instance where the PFX certificate is stored. This can be achieved using the web UI or the SDK.
+
+## Template deployment
+
+### First time deployment
+
+Once setup is completed and the required parameters populated in [azuredeploy.parameters.json](azuredeploy.parameters.json), you can deploy the template with the following command:
+
+```powershell
+$resourceGroup=""
+
+New-AzureRmResourceGroupDeployment `
+  -Name "RegistryDeployment-$((Get-Date).ToString("yyyyMMddHHmmss"))" `
+  -ResourceGroupName $resourceGroup `
+  -TemplateFile "azuredeploy.json" `
+  -TemplateParameterFile "azuredeploy.parameters.json"
 ```
 
-After that, you can create the `.pfx` archive with the following command
+### Upgrade
 
-```bash
-openssl pkcs12 -export -out cert.pfx -inkey privkey.pem -in cert.pem -certfile chain.pem
-```
-
-Remember to keep around the certificate fingerprint as the template requires it as an input parameter:
-
-```bash
-openssl x509 -in cert.crt -noout -fingerprint | cut -d= -f2 | sed 's/://g'
-```
+In order to upgrade the guest OS or the container registry itself, update [azuredeploy.json](azuredeploy.json) as needed and run once again `New-AzureRmResourceGroupDeployment` as previously indicated.
 
 ## Usage
 
 ### Populate your Registry
 
-Your registry can store images you produce yourself or images from any public registry. The only requirement is to apply the appropriate [tag](https://docs.docker.com/engine/reference/commandline/tag/#tag-an-image-for-a-private-repository) to the images.
+Your registry can store images you produce yourself or images from any public registry. The only requirement is to apply the appropriate [tag](https://docs.docker.com/engine/reference/commandline/tag/#tag-an-image-for-a-private-repository) to the container images before you push to it.
 
-```bash
+```powershell
+# login if needed
+docker login -u my-user -p my-password  my-registry.com
 # fetch an image from docker hub
 docker pull hello-world:latest
 # re-tag it using your registry information
 # my-registry => Public IP DNS Label
-docker tag hello-world:latest my-registry/hello-world:latest
+docker tag hello-world:latest my-registry.com/hello-world:latest
 # push to your private registry
-docker push my-registry/hello-world:latest
+docker push my-registry.com/hello-world:latest
 ```
 
-## Future improvements
+## FAQ
 
-- Run multiple containers
-- Add KeyVault deployment
-- Reduce number of mandatory parameters
-- Support/document self signed certs
+### Can I use a self-signed certificate?
+
+Yes. You can use this PowerShell snipped to generate a self-signed certificate. 
+
+```powershell
+$PASSWORD=""
+$CN=""
+
+# Create a self-signed certificate
+$ssc = New-SelfSignedCertificate -certstorelocation cert:\LocalMachine\My -dnsname $CN
+$crt = "cert:\localMachine\my\" + $ssc.Thumbprint
+$pwd = ConvertTo-SecureString -String $PASSWORD -Force -AsPlainText
+Export-PfxCertificate -cert $crt -FilePath "cert.pfx" -Password $pwd
+```
+
+or using `openssl`
+
+```bash
+PASSWORD=""
+CN=""
+
+openssl req -x509 -newkey rsa:2048 -subj "/CN=${CN}" -days 365 -out cert.crt -keyout cert.pem -passout pass:${PASSWORD}
+```
+
+Restart the docker daemon once the self-signed certificate is trusted by the registry client.
+
+### I do not have a .pfx certificate, I got a private key and a public key pair (.crt and .key)
+
+You can use `openssl` to create a .pfx out of a public and private key.
+
+```bash
+openssl pkcs12 -export -in cert.crt -inkey cert.pem  -passin pass:${PASSWORD} -out cert.pfx -passout pass:${PASSWORD}
+```
+
+### The ARM deployment went through fine, but the registry does not seem to be working. How can I troubleshoot it?
+
+The template blocks SSH traffic (TCP 22) by default. You need to add a new inbound rule to allow SSH traffic through the Network Security Group.
+
+Once you are able to remote into the virtual machine, you can inspect the provisioning logs at `/var/log/azure/docker-registry.log`
+
+If that's not enough, looking at the container logs should give you an idea of what the problem may be.
+
+```bash
+docker logs registry ${CONTAINER_ID}
+```
